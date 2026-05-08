@@ -1,0 +1,67 @@
+name: Build & Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.9'
+          channel: 'stable'
+          cache: true
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+
+      - name: Rename APK
+        run: |
+          mv build/app/outputs/flutter-apk/app-release.apk build/app/outputs/flutter-apk/portal-smart-digital.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portal-smart-digital-apk
+          path: build/app/outputs/flutter-apk/portal-smart-digital.apk
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/app/outputs/flutter-apk/portal-smart-digital.apk
+          generate_release_notes: true
+          name: "Portal Smart Digital Release"
+          body: |
+            ## 📱 Portal Smart Digital
+            
+            Download APK di bawah untuk install di HP Android.
+            
+            ### Cara Install:
+            1. Download file `portal-smart-digital.apk`
+            2. Buka file tersebut di HP Android
+            3. Jika diminta izin "Install dari sumber tidak dikenal", aktifkan
+            4. Ikuti instruksi instalasi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,19 +1,19 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../../core/theme/app_colors.dart';
+import '../../../../schedule/providers/schedule_provider.dart';
 import '../../data/models/class_attendance_models.dart';
 import '../../providers/class_attendance_session.dart';
 import '../design/attendance_tokens.dart';
-import '../widgets/jadwal_picker.dart';
 import '../widgets/manual_scanner_panel.dart';
 import '../widgets/metode_tabs.dart';
 import '../widgets/qr_scanner_panel.dart';
 import '../widgets/result_flash_overlay.dart';
 import '../widgets/rfid_scanner_panel.dart';
-import '../widgets/session_hero_card.dart';
 import '../widgets/session_history_list.dart';
-import '../widgets/tipe_chooser.dart';
 
 class ClassAttendancePage extends ConsumerStatefulWidget {
   const ClassAttendancePage({super.key});
@@ -23,8 +23,33 @@ class ClassAttendancePage extends ConsumerStatefulWidget {
       _ClassAttendancePageState();
 }
 
-class _ClassAttendancePageState extends ConsumerState<ClassAttendancePage> {
+class _ClassAttendancePageState extends ConsumerState<ClassAttendancePage>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
   bool _cooldown = false;
+  Timer? _flashTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+    _tabController.addListener(_onTabChanged);
+  }
+
+  void _onTabChanged() {
+    if (!_tabController.indexIsChanging) return;
+    final tipe =
+        _tabController.index == 0 ? TipeAbsensi.masuk : TipeAbsensi.pulang;
+    ref.read(classAttendanceSessionProvider.notifier).setTipe(tipe);
+  }
+
+  @override
+  void dispose() {
+    _tabController.removeListener(_onTabChanged);
+    _tabController.dispose();
+    _flashTimer?.cancel();
+    super.dispose();
+  }
 
   Future<void> _handleScan(ScanInput input) async {
     if (_cooldown) return;
@@ -32,17 +57,25 @@ class _ClassAttendancePageState extends ConsumerState<ClassAttendancePage> {
     try {
       final saved = await ref
           .read(classAttendanceSessionProvider.notifier)
-          .recordScan(
-            input: input,
-            status: StatusAbsensi.hadir,
-          );
+          .recordScan(input: input, status: StatusAbsensi.hadir);
+
       if (!mounted) return;
+      final lastStudent =
+          ref.read(classAttendanceSessionProvider).lastScannedStudent;
+
       await ResultFlash.show(
         context,
         success: true,
         title: saved.namaSiswa ?? 'Tersimpan',
         subtitle: 'NIS ${saved.nisSiswa ?? '-'} • ${saved.statusAbsensi.label}',
+        photoUrl: lastStudent?.fotoProfile,
       );
+      _flashTimer?.cancel();
+      _flashTimer = Timer(const Duration(seconds: 3), () {
+        if (mounted) {
+          ref.read(classAttendanceSessionProvider.notifier).clearLastStudent();
+        }
+      });
     } on AttendanceException catch (e) {
       if (!mounted) return;
       await ResultFlash.show(
@@ -87,233 +120,194 @@ class _ClassAttendancePageState extends ConsumerState<ClassAttendancePage> {
     final state = ref.watch(classAttendanceSessionProvider);
     final notifier = ref.read(classAttendanceSessionProvider.notifier);
 
-    // Handle system back: kalau bukan di fase pertama (selectJadwal),
-    // kembali ke fase sebelumnya alih-alih keluar halaman.
+    ref.listen(myJadwalForAttendanceProvider, (_, next) {
+      next.whenData((_) {
+        ref.read(classAttendanceSessionProvider.notifier).refreshJadwal();
+      });
+    });
+
     return PopScope(
-      canPop: state.phase == SessionPhase.selectJadwal,
-      onPopInvokedWithResult: (didPop, _) {
-        if (didPop) return;
-        notifier.back();
-      },
+      canPop: true,
       child: Scaffold(
+        // false: Scaffold tidak resize saat keyboard naik. Manual panel
+        // handle viewInsets-nya sendiri lewat AnimatedPadding. Ini cegah
+        // rebuild storm saat keyboard animasi.
+        resizeToAvoidBottomInset: false,
         backgroundColor: AppColors.scaffoldBg,
-        body: AnimatedSwitcher(
-        duration: AttendanceTokens.dNormal,
-        switchInCurve: AttendanceTokens.easeOutCubic,
-        switchOutCurve: AttendanceTokens.easeOutCubic,
-        transitionBuilder: (child, anim) {
-          return FadeTransition(
-            opacity: anim,
-            child: SlideTransition(
-              position: Tween<Offset>(
-                begin: const Offset(0.04, 0),
-                end: Offset.zero,
-              ).animate(anim),
-              child: child,
-            ),
-          );
-        },
-        child: _buildPhase(state, notifier),
-      ),
-      ),
-    );
-  }
-
-  Widget _buildPhase(ClassAttendanceSessionState state,
-      ClassAttendanceSessionNotifier notifier) {
-    switch (state.phase) {
-      case SessionPhase.selectJadwal:
-        return _JadwalPhase(
-          key: const ValueKey('phase-jadwal'),
-          onSelect: (j) => notifier.selectJadwal(j),
-          error: state.lastError,
-        );
-      case SessionPhase.selectTipe:
-        return _TipePhase(
-          key: const ValueKey('phase-tipe'),
-          jadwal: state.jadwal!,
-          onBack: notifier.back,
-          onSelect: (t) => notifier.selectTipe(t),
-        );
-      case SessionPhase.scanning:
-        return _ScannerPhase(
-          key: const ValueKey('phase-scan'),
-          state: state,
-          onBack: notifier.back,
-          onMetodeChange: notifier.setMetode,
-          onScan: _handleScan,
-          onUndo: notifier.undoRecord,
-        );
-    }
-  }
-}
-
-class _JadwalPhase extends StatelessWidget {
-  const _JadwalPhase({
-    super.key,
-    required this.onSelect,
-    this.error,
-  });
-  final void Function(dynamic jadwal) onSelect;
-  final AttendanceException? error;
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(4, 8, 16, 4),
-            child: Row(
-              children: [
-                IconButton(
-                  onPressed: () => Navigator.of(context).maybePop(),
-                  icon: const Icon(Icons.arrow_back_rounded),
-                ),
-                const SizedBox(width: 4),
-                const Expanded(
-                  child: Text(
-                    'Absensi Kelas',
-                    style: TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (error != null)
+        appBar: AppBar(
+          title: const Text('Absensi Siswa'),
+          scrolledUnderElevation: 0,
+        ),
+        body: Column(
+          children: [
+            // Tab Masuk/Pulang
             Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: AppColors.error.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.warning_amber_rounded,
-                      color: AppColors.error),
-                  const SizedBox(width: 8),
-                  Expanded(
-                      child: Text(error!.message,
-                          style:
-                              const TextStyle(color: AppColors.error, fontSize: 12))),
+              color: Colors.white,
+              child: TabBar(
+                controller: _tabController,
+                labelColor: AppColors.primary,
+                unselectedLabelColor: AppColors.textSecondary,
+                indicatorColor: AppColors.primary,
+                indicatorWeight: 3,
+                labelStyle: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                  fontSize: 14,
+                ),
+                unselectedLabelStyle: const TextStyle(
+                  fontWeight: FontWeight.w500,
+                  fontSize: 14,
+                ),
+                tabs: const [
+                  Tab(text: 'Masuk'),
+                  Tab(text: 'Pulang'),
                 ],
               ),
             ),
-          Expanded(child: JadwalPicker(onSelected: onSelect)),
-        ],
-      ),
-    );
-  }
-}
-
-class _TipePhase extends StatelessWidget {
-  const _TipePhase({
-    super.key,
-    required this.jadwal,
-    required this.onSelect,
-    required this.onBack,
-  });
-  final dynamic jadwal;
-  final void Function(TipeAbsensi tipe) onSelect;
-  final VoidCallback onBack;
-
-  @override
-  Widget build(BuildContext context) {
-    return TipeChooser(
-      jadwal: jadwal,
-      onSelected: onSelect,
-      onBack: onBack,
-    );
-  }
-}
-
-class _ScannerPhase extends StatelessWidget {
-  const _ScannerPhase({
-    super.key,
-    required this.state,
-    required this.onBack,
-    required this.onMetodeChange,
-    required this.onScan,
-    required this.onUndo,
-  });
-
-  final ClassAttendanceSessionState state;
-  final VoidCallback onBack;
-  final void Function(MetodeAbsensi) onMetodeChange;
-  final Future<void> Function(ScanInput) onScan;
-  final Future<void> Function(AbsensiRecord) onUndo;
-
-  @override
-  Widget build(BuildContext context) {
-    final jadwal = state.jadwal!;
-    final tipe = state.tipe!;
-    final enabled = !state.isSubmitting;
-
-    return Container(
-      color: AppColors.scaffoldBg,
-      child: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            // Height budget: sisa setelah hero + tabs + paddings = total.
-            // Scanner minimal 280, history minimal 160. Ambil proporsi 60/40.
-            final availableH = constraints.maxHeight;
-            final scannerH = (availableH * 0.6).clamp(280.0, 520.0);
-            final historyH =
-                (availableH - scannerH - 140).clamp(140.0, 260.0);
-
-            return SingleChildScrollView(
-              physics: const ClampingScrollPhysics(),
-              child: Column(
-                children: [
-                  SessionHeroCard(
-                    jadwal: jadwal,
-                    tipe: tipe,
-                    totalTercatat: state.totalTercatat,
-                    onBack: onBack,
-                  ),
-                  const SizedBox(height: 12),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: MetodeTabs(
-                      active: state.metode,
-                      onChanged: onMetodeChange,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: SizedBox(
-                      height: scannerH,
+            const Divider(height: 1, color: AppColors.divider),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+              child: MetodeTabs(
+                active: state.metode,
+                onChanged: notifier.setMetode,
+              ),
+            ),
+            // Scanner area: 60% dari sisa space.
+            // Flash card di-overlay di atas scanner pakai Stack supaya
+            // tidak push layout & cegah bottom overflow saat muncul.
+            Expanded(
+              flex: 6,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Stack(
+                  children: [
+                    Positioned.fill(
                       child: _ScannerSurface(
                         metode: state.metode,
-                        enabled: enabled,
-                        onScan: onScan,
+                        enabled: !state.isSubmitting,
+                        onScan: _handleScan,
                       ),
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    height: historyH,
-                    child: _HistorySheet(
-                      records: state.history,
-                      onUndo: onUndo,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                ],
+                    if (state.lastScannedStudent != null)
+                      Positioned(
+                        left: 8,
+                        right: 8,
+                        bottom: 8,
+                        child: _StudentFlashCard(
+                          student: state.lastScannedStudent!,
+                        ),
+                      ),
+                  ],
+                ),
               ),
-            );
-          },
+            ),
+            const SizedBox(height: 12),
+            // History area: 40% dari sisa space
+            Expanded(
+              flex: 4,
+              child: _HistorySheetInline(
+                records: state.todayHistory,
+                isLoading: state.isLoadingHistory,
+                onUndo: notifier.undoRecord,
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
         ),
       ),
     );
   }
 }
 
+/// Flash card showing last scanned student info.
+class _StudentFlashCard extends StatelessWidget {
+  const _StudentFlashCard({required this.student});
+  final StudentLite student;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        // Solid background supaya tidak transparan menutupi scanner.
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(AttendanceTokens.cornerRadius),
+        border: Border.all(
+          color: AppColors.success.withValues(alpha: 0.5),
+          width: 1.5,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: AppColors.success.withValues(alpha: 0.15),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          _buildAvatar(),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  student.namaSiswa,
+                  style: const TextStyle(
+                    color: AppColors.textPrimary,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  'Kelas ${student.kelas} • NIS ${student.nis}',
+                  style: const TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Icon(
+            Icons.check_circle_rounded,
+            color: AppColors.success,
+            size: 22,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAvatar() {
+    if (student.fotoProfile != null && student.fotoProfile!.isNotEmpty) {
+      return CircleAvatar(
+        radius: 18,
+        backgroundColor: AppColors.success.withValues(alpha: 0.15),
+        backgroundImage: NetworkImage(student.fotoProfile!),
+        onBackgroundImageError: (_, __) {},
+      );
+    }
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: AppColors.success.withValues(alpha: 0.15),
+      ),
+      child: const Icon(
+        Icons.person_rounded,
+        color: AppColors.success,
+        size: 20,
+      ),
+    );
+  }
+}
+
+/// Scanner surface with animated switching between methods.
 class _ScannerSurface extends StatelessWidget {
   const _ScannerSurface({
     required this.metode,
@@ -358,8 +352,7 @@ class _ScannerSurface extends StatelessWidget {
         ),
         child: AnimatedSwitcher(
           duration: AttendanceTokens.dNormal,
-          transitionBuilder: (c, a) =>
-              FadeTransition(opacity: a, child: c),
+          transitionBuilder: (c, a) => FadeTransition(opacity: a, child: c),
           child: SizedBox(
             key: ValueKey(metode),
             width: double.infinity,
@@ -372,12 +365,15 @@ class _ScannerSurface extends StatelessWidget {
   }
 }
 
-class _HistorySheet extends StatelessWidget {
-  const _HistorySheet({
+/// Inline history list — porsi bawah halaman.
+class _HistorySheetInline extends StatelessWidget {
+  const _HistorySheetInline({
     required this.records,
+    required this.isLoading,
     required this.onUndo,
   });
   final List<AbsensiRecord> records;
+  final bool isLoading;
   final Future<void> Function(AbsensiRecord) onUndo;
 
   @override
@@ -395,11 +391,14 @@ class _HistorySheet extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(14, 12, 14, 6),
             child: Row(
               children: [
-                Icon(Icons.history_rounded,
-                    size: 16, color: AppColors.textSecondary),
+                const Icon(
+                  Icons.history_rounded,
+                  size: 16,
+                  color: AppColors.textSecondary,
+                ),
                 const SizedBox(width: 8),
                 const Text(
-                  'Riwayat Sesi',
+                  'Riwayat Hari Ini',
                   style: TextStyle(
                     color: AppColors.textPrimary,
                     fontSize: 13,
@@ -407,22 +406,31 @@ class _HistorySheet extends StatelessWidget {
                   ),
                 ),
                 const Spacer(),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                  decoration: BoxDecoration(
-                    color: AppColors.primary.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    '${records.length}',
-                    style: const TextStyle(
-                      color: AppColors.primary,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w800,
+                if (isLoading)
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                else
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppColors.primary.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '${records.length}',
+                      style: const TextStyle(
+                        color: AppColors.primary,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
                   ),
-                ),
               ],
             ),
           ),

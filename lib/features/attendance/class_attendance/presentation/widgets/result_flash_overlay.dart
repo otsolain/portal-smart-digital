@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import '../design/attendance_tokens.dart';
 
 /// Overlay layar penuh yang muncul sebentar saat scan sukses/gagal.
-/// Dipicu lewat [ResultFlashController], tidak perlu state parent.
+/// Dipicu lewat [ResultFlash.show], tidak perlu state parent.
 class ResultFlash {
   ResultFlash._();
 
@@ -15,6 +15,7 @@ class ResultFlash {
     required bool success,
     required String title,
     String? subtitle,
+    String? photoUrl,
   }) async {
     // Haptik — aman kalau device tidak mendukung.
     try {
@@ -32,6 +33,7 @@ class ResultFlash {
         success: success,
         title: title,
         subtitle: subtitle,
+        photoUrl: photoUrl,
       ),
     );
     _entry = entry;
@@ -56,11 +58,13 @@ class _FlashWidget extends StatefulWidget {
     required this.success,
     required this.title,
     this.subtitle,
+    this.photoUrl,
   });
 
   final bool success;
   final String title;
   final String? subtitle;
+  final String? photoUrl;
 
   @override
   State<_FlashWidget> createState() => _FlashWidgetState();
@@ -148,21 +152,7 @@ class _FlashWidgetState extends State<_FlashWidget>
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Container(
-                            width: 46,
-                            height: 46,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: color.withValues(alpha: 0.15),
-                            ),
-                            child: Icon(
-                              widget.success
-                                  ? Icons.check_rounded
-                                  : Icons.close_rounded,
-                              size: 28,
-                              color: color,
-                            ),
-                          ),
+                          _buildLeadingIcon(color),
                           const SizedBox(width: 14),
                           Flexible(
                             child: Column(
@@ -198,6 +188,33 @@ class _FlashWidgetState extends State<_FlashWidget>
             ),
           );
         },
+      ),
+    );
+  }
+
+  Widget _buildLeadingIcon(Color color) {
+    // Show student photo if available and success
+    if (widget.success && widget.photoUrl != null && widget.photoUrl!.isNotEmpty) {
+      return CircleAvatar(
+        radius: 23,
+        backgroundColor: color.withValues(alpha: 0.15),
+        backgroundImage: NetworkImage(widget.photoUrl!),
+        onBackgroundImageError: (_, __) {},
+        child: null,
+      );
+    }
+
+    return Container(
+      width: 46,
+      height: 46,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: color.withValues(alpha: 0.15),
+      ),
+      child: Icon(
+        widget.success ? Icons.check_rounded : Icons.close_rounded,
+        size: 28,
+        color: color,
       ),
     );
   }

@@ -224,6 +224,7 @@ class StudentLite {
   final String namaSiswa;
   final String kelas;
   final String idSekolah;
+  final String? fotoProfile;
 
   const StudentLite({
     required this.id,
@@ -231,6 +232,7 @@ class StudentLite {
     required this.namaSiswa,
     required this.kelas,
     required this.idSekolah,
+    this.fotoProfile,
   });
 
   factory StudentLite.fromJson(Map<String, dynamic> json) {
@@ -240,6 +242,7 @@ class StudentLite {
       namaSiswa: json['nama_siswa']?.toString() ?? '',
       kelas: json['kelas']?.toString() ?? '',
       idSekolah: json['id_sekolah']?.toString() ?? '',
+      fotoProfile: json['foto_profile']?.toString(),
     );
   }
 }

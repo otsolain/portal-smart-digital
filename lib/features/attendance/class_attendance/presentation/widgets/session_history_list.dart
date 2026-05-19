@@ -9,10 +9,12 @@ class SessionHistoryList extends StatelessWidget {
     super.key,
     required this.records,
     required this.onUndo,
+    this.scrollController,
   });
 
   final List<AbsensiRecord> records;
   final Future<void> Function(AbsensiRecord record) onUndo;
+  final ScrollController? scrollController;
 
   @override
   Widget build(BuildContext context) {
@@ -57,6 +59,7 @@ class SessionHistoryList extends StatelessWidget {
     }
 
     return ListView.builder(
+      controller: scrollController,
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
       itemCount: records.length,
       itemBuilder: (context, i) {
@@ -165,12 +168,41 @@ class _HistoryTile extends StatelessWidget {
                     overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 2),
-                  Text(
-                    'NIS ${record.nisSiswa ?? '-'}  •  ${record.jamAbsensi}',
-                    style: TextStyle(
-                      color: AppColors.textMuted,
-                      fontSize: 11,
-                    ),
+                  Row(
+                    children: [
+                      if (record.kelas.isNotEmpty) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            color: AppColors.primary
+                                .withValues(alpha: 0.08),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            record.kelas,
+                            style: const TextStyle(
+                              color: AppColors.primary,
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                      ],
+                      Expanded(
+                        child: Text(
+                          'NIS ${record.nisSiswa ?? '-'} • ${record.jamAbsensi}',
+                          style: const TextStyle(
+                            color: AppColors.textMuted,
+                            fontSize: 11,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),

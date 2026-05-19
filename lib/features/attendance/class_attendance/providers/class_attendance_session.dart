@@ -7,254 +7,288 @@ import '../data/models/class_attendance_models.dart';
 import '../data/repositories/absensi_repository.dart';
 import '../data/repositories/student_resolver.dart';
 
-/// Fase UI halaman absensi kelas.
-enum SessionPhase {
-  selectJadwal,
-  selectTipe,
-  scanning,
-}
-
-/// State untuk sesi absensi yang sedang berjalan.
-class ClassAttendanceSessionState {
-  final SessionPhase phase;
-  final JadwalPelajaran? jadwal;
-  final TipeAbsensi? tipe;
+/// Simplified state — no more selectJadwal/selectTipe phases.
+/// Jadwal is auto-detected, tipe is controlled by tab.
+class SimpleAttendanceState {
+  final TipeAbsensi tipe;
   final MetodeAbsensi metode;
-  final List<AbsensiRecord> history;
+  final JadwalPelajaran? detectedJadwal;
+  final List<AbsensiRecord> todayHistory;
   final bool isSubmitting;
+  final StudentLite? lastScannedStudent;
   final AttendanceException? lastError;
+  final bool isLoadingHistory;
 
-  const ClassAttendanceSessionState({
-    this.phase = SessionPhase.selectJadwal,
-    this.jadwal,
-    this.tipe,
+  const SimpleAttendanceState({
+    this.tipe = TipeAbsensi.masuk,
     this.metode = MetodeAbsensi.rfid,
-    this.history = const [],
+    this.detectedJadwal,
+    this.todayHistory = const [],
     this.isSubmitting = false,
+    this.lastScannedStudent,
     this.lastError,
+    this.isLoadingHistory = false,
   });
 
-  ClassAttendanceSessionState copyWith({
-    SessionPhase? phase,
-    JadwalPelajaran? jadwal,
+  SimpleAttendanceState copyWith({
     TipeAbsensi? tipe,
     MetodeAbsensi? metode,
-    List<AbsensiRecord>? history,
+    JadwalPelajaran? detectedJadwal,
+    List<AbsensiRecord>? todayHistory,
     bool? isSubmitting,
+    StudentLite? lastScannedStudent,
     AttendanceException? lastError,
+    bool? isLoadingHistory,
     bool clearError = false,
+    bool clearLastStudent = false,
     bool clearJadwal = false,
-    bool clearTipe = false,
   }) {
-    return ClassAttendanceSessionState(
-      phase: phase ?? this.phase,
-      jadwal: clearJadwal ? null : (jadwal ?? this.jadwal),
-      tipe: clearTipe ? null : (tipe ?? this.tipe),
+    return SimpleAttendanceState(
+      tipe: tipe ?? this.tipe,
       metode: metode ?? this.metode,
-      history: history ?? this.history,
+      detectedJadwal:
+          clearJadwal ? null : (detectedJadwal ?? this.detectedJadwal),
+      todayHistory: todayHistory ?? this.todayHistory,
       isSubmitting: isSubmitting ?? this.isSubmitting,
+      lastScannedStudent: clearLastStudent
+          ? null
+          : (lastScannedStudent ?? this.lastScannedStudent),
       lastError: clearError ? null : (lastError ?? this.lastError),
+      isLoadingHistory: isLoadingHistory ?? this.isLoadingHistory,
     );
   }
 
-  int get totalTercatat => history.length;
-  Set<String> get studentIdsTercatat => history.map((r) => r.idSiswa).toSet();
-  bool get hasActiveSession => phase == SessionPhase.scanning && jadwal != null && tipe != null;
+  int get totalTercatat => todayHistory.length;
+  Set<String> get studentIdsTercatat =>
+      todayHistory.map((r) => r.idSiswa).toSet();
 }
 
-class ClassAttendanceSessionNotifier
-    extends StateNotifier<ClassAttendanceSessionState> {
-  ClassAttendanceSessionNotifier({
+class SimpleAttendanceNotifier extends StateNotifier<SimpleAttendanceState> {
+  SimpleAttendanceNotifier({
     required this.ref,
     required this.repository,
     required this.resolver,
-  }) : super(const ClassAttendanceSessionState());
+  }) : super(const SimpleAttendanceState()) {
+    _autoDetectJadwal();
+  }
 
   final Ref ref;
   final AbsensiRepository repository;
   final StudentResolver resolver;
 
-  /// Langkah 1: user pilih jadwal. Validasi guru pengampu dilakukan di sini.
-  Future<void> selectJadwal(JadwalPelajaran jadwal) async {
-    final userId = ref.read(authProvider).user?.id;
-    final idSekolah = ref.read(currentIdSekolahProvider);
-
-    if (userId == null || idSekolah == null) {
-      state = state.copyWith(
-        lastError: const AttendanceException(
-          AttendanceErrorCode.notAuthorized,
-          'Sesi tidak valid, silakan login ulang.',
-        ),
-      );
-      return;
-    }
-
-    if (jadwal.idSekolah != idSekolah) {
-      state = state.copyWith(
-        lastError: const AttendanceException(
-          AttendanceErrorCode.notAuthorized,
-          'Jadwal bukan dari sekolah Anda.',
-        ),
-      );
-      return;
-    }
-
-    // Guru pengampu: pakai provider STRICT (level 1 = guru_id, level 2 = nama).
-    // Fallback by-mapel sengaja tidak dipakai untuk write action ini supaya
-    // guru tidak bisa absensi kelas guru lain yang kebetulan ngajar mapel sama.
-    //
-    // Kalau provider belum data (loading/error), kita lempar error yang
-    // user-friendly daripada false-negative "bukan pengampu".
+  /// Auto-detect jadwal based on current time.
+  void _autoDetectJadwal() {
     final myJadwalAsync = ref.read(myJadwalForAttendanceProvider);
-    if (myJadwalAsync.isLoading) {
-      state = state.copyWith(
-        lastError: const AttendanceException(
-          AttendanceErrorCode.unknown,
-          'Sedang memuat jadwal Anda. Coba lagi sebentar.',
-        ),
-      );
-      return;
-    }
-    final myList = myJadwalAsync.maybeWhen(
-      data: (l) => l,
-      orElse: () => const <JadwalPelajaran>[],
-    );
-    final isOwner = myList.any((j) => j.id == jadwal.id);
-
-    if (!isOwner) {
-      state = state.copyWith(
-        lastError: const AttendanceException(
-          AttendanceErrorCode.notAuthorized,
-          'Anda bukan guru pengampu jadwal ini.',
-        ),
-      );
-      return;
-    }
-
-    state = state.copyWith(
-      phase: SessionPhase.selectTipe,
-      jadwal: jadwal,
-      history: const [],
-      clearTipe: true,
-      clearError: true,
-    );
+    myJadwalAsync.whenData((jadwalList) {
+      final detected = _findCurrentJadwal(jadwalList);
+      state = state.copyWith(detectedJadwal: detected, clearJadwal: detected == null);
+      _loadHistory();
+    });
   }
 
-  /// Langkah 2: user pilih tipe absensi (masuk/pulang).
-  Future<void> selectTipe(TipeAbsensi tipe) async {
-    final jadwal = state.jadwal;
-    final idSekolah = ref.read(currentIdSekolahProvider);
-    if (jadwal == null || idSekolah == null) return;
+  /// Find jadwal that matches current day and time.
+  /// Priority: exact time match > closest jadwal today > null.
+  JadwalPelajaran? _findCurrentJadwal(List<JadwalPelajaran> jadwalList) {
+    final now = DateTime.now();
+    final todayName = _getDayName(now.weekday);
 
-    // Muat history yang sudah ada untuk sesi (jadwal + tipe + tanggal hari ini).
-    final tanggal = _today();
+    // Filter by today
+    final todayJadwal =
+        jadwalList.where((j) => j.hari.toLowerCase() == todayName).toList();
+    if (todayJadwal.isEmpty) return null;
+
+    // Find the one where current time is between jamMulai and jamSelesai
+    final currentMinutes = now.hour * 60 + now.minute;
+    for (final j in todayJadwal) {
+      final mulai = _parseTimeToMinutes(j.jamMulai);
+      final selesai = _parseTimeToMinutes(j.jamSelesai);
+      if (mulai != null && selesai != null) {
+        if (currentMinutes >= mulai && currentMinutes <= selesai) {
+          return j;
+        }
+      }
+    }
+
+    // Fallback: find the closest jadwal (smallest absolute distance)
+    JadwalPelajaran? closest;
+    int closestDist = 999999;
+    for (final j in todayJadwal) {
+      final mulai = _parseTimeToMinutes(j.jamMulai);
+      final selesai = _parseTimeToMinutes(j.jamSelesai);
+      if (mulai == null || selesai == null) continue;
+      final distToMulai = (currentMinutes - mulai).abs();
+      final distToSelesai = (currentMinutes - selesai).abs();
+      final dist = distToMulai < distToSelesai ? distToMulai : distToSelesai;
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = j;
+      }
+    }
+    return closest;
+  }
+
+  String _getDayName(int weekday) {
+    const days = [
+      'senin',
+      'selasa',
+      'rabu',
+      'kamis',
+      'jumat',
+      'sabtu',
+      'minggu'
+    ];
+    return days[(weekday - 1) % 7];
+  }
+
+  int? _parseTimeToMinutes(String time) {
+    // Supports "HH:mm" or "HH:mm:ss"
+    final parts = time.split(':');
+    if (parts.length < 2) return null;
+    final hour = int.tryParse(parts[0]);
+    final minute = int.tryParse(parts[1]);
+    if (hour == null || minute == null) return null;
+    return hour * 60 + minute;
+  }
+
+  /// Refresh jadwal detection (e.g. when provider data arrives later).
+  void refreshJadwal() {
+    _autoDetectJadwal();
+  }
+
+  /// Switch tipe (masuk/pulang) — triggered by tab change.
+  void setTipe(TipeAbsensi tipe) {
+    if (tipe == state.tipe) return;
+    state = state.copyWith(
+      tipe: tipe,
+      todayHistory: const [],
+      clearError: true,
+      clearLastStudent: true,
+    );
+    _loadHistory();
+  }
+
+  /// Switch scan method.
+  void setMetode(MetodeAbsensi metode) {
+    state = state.copyWith(metode: metode, clearError: true);
+  }
+
+  /// Clear the last scanned student (dismiss flash card).
+  void clearLastStudent() {
+    state = state.copyWith(clearLastStudent: true);
+  }
+
+  /// Load today's history for current jadwal + tipe.
+  /// If no jadwal detected, load all records for today (no jadwal filter).
+  Future<void> _loadHistory() async {
+    final jadwal = state.detectedJadwal;
+    final idSekolah = ref.read(currentIdSekolahProvider);
+    if (idSekolah == null) return;
+
+    state = state.copyWith(isLoadingHistory: true);
     try {
-      final existing = await repository.getSessionRecords(
+      final records = await repository.getSessionRecords(
         idSekolah: idSekolah,
-        idJadwal: jadwal.id,
-        tanggal: tanggal,
-        tipe: tipe,
+        idJadwal: jadwal?.id ?? '',
+        tanggal: _today(),
+        tipe: state.tipe,
       );
-      state = state.copyWith(
-        phase: SessionPhase.scanning,
-        tipe: tipe,
-        history: existing,
-        clearError: true,
-      );
+      state = state.copyWith(todayHistory: records, isLoadingHistory: false);
     } on AttendanceException catch (e) {
-      // Masih bisa masuk ke scanner walau history gagal fetch.
       state = state.copyWith(
-        phase: SessionPhase.scanning,
-        tipe: tipe,
-        history: const [],
+        todayHistory: const [],
+        isLoadingHistory: false,
         lastError: e,
       );
     }
   }
 
-  /// Ganti metode scan tanpa reset history.
-  void setMetode(MetodeAbsensi metode) {
-    state = state.copyWith(metode: metode, clearError: true);
-  }
-
-  /// Kembali ke fase sebelumnya.
-  void back() {
-    switch (state.phase) {
-      case SessionPhase.selectJadwal:
-        break;
-      case SessionPhase.selectTipe:
-        state = state.copyWith(
-          phase: SessionPhase.selectJadwal,
-          clearJadwal: true,
-          clearTipe: true,
-          history: const [],
-          clearError: true,
-        );
-        break;
-      case SessionPhase.scanning:
-        state = state.copyWith(
-          phase: SessionPhase.selectTipe,
-          clearTipe: true,
-          history: const [],
-          clearError: true,
-        );
-        break;
-    }
-  }
-
-  /// Reset total (misal keluar dari halaman).
-  void reset() {
-    state = const ClassAttendanceSessionState();
-  }
-
-  /// Satu "scan" — resolve identitas, validasi, simpan, update history.
-  /// Return record yang tersimpan supaya UI bisa animasikan flash success.
+  /// Record a scan — resolve identity, validate, save, update history.
+  /// Validation:
+  /// - Student must exist in DB
+  /// - Student must be from same school
+  /// - If jadwal detected: student must be from that jadwal's class
+  /// - If no jadwal detected: student must be from one of the teacher's
+  ///   taught classes (otherwise teacher is scanning students they don't teach)
+  /// If no jadwal detected, record with empty id_jadwal.
   Future<AbsensiRecord> recordScan({
     required ScanInput input,
     required StatusAbsensi status,
     String? keterangan,
   }) async {
-    final jadwal = state.jadwal;
+    final jadwal = state.detectedJadwal;
     final tipe = state.tipe;
     final userId = ref.read(authProvider).user?.id;
     final idSekolah = ref.read(currentIdSekolahProvider);
+    // Coba fetch guruStaffId. Kalau null, retry sekali dengan invalidate
+    // (kemungkinan cache stale atau network glitch).
+    var guruStaffId = await ref.read(currentGuruStaffIdProvider.future);
+    if (guruStaffId == null) {
+      ref.invalidate(currentGuruStaffIdProvider);
+      try {
+        guruStaffId = await ref.read(currentGuruStaffIdProvider.future);
+      } catch (_) {
+        // ignore — guruStaffId tetap null, error spesifik di bawah.
+      }
+    }
 
-    // `absensi.id_guru` FK ke `guru_staff(id)`, bukan ke `users(id)`.
-    // Harus lookup dulu sebelum insert.
-    final guruStaffId = await ref.read(currentGuruStaffIdProvider.future);
-
-    if (!state.hasActiveSession ||
-        jadwal == null ||
-        tipe == null ||
-        userId == null ||
-        idSekolah == null ||
-        guruStaffId == null) {
+    if (userId == null || idSekolah == null) {
       throw const AttendanceException(
         AttendanceErrorCode.notAuthorized,
-        'Sesi tidak aktif atau akun guru belum terhubung ke guru_staff.',
+        'Sesi login tidak valid. Silakan login ulang.',
+      );
+    }
+    if (guruStaffId == null) {
+      throw const AttendanceException(
+        AttendanceErrorCode.notAuthorized,
+        'Akun guru belum terhubung ke data guru_staff. '
+        'Hubungi admin sekolah.',
       );
     }
 
     state = state.copyWith(isSubmitting: true, clearError: true);
     try {
-      // 1. Resolve ke StudentLite
+      // 1. Resolve to StudentLite
       final student = await input.resolve(resolver, idSekolah);
 
-      // 2. Validasi kelas + sekolah
+      // 2. Validate school
       if (student.idSekolah != idSekolah) {
         throw const AttendanceException(
           AttendanceErrorCode.studentWrongSchool,
           'Siswa bukan dari sekolah Anda.',
         );
       }
-      if (student.kelas != jadwal.kelas) {
-        throw AttendanceException(
-          AttendanceErrorCode.studentWrongClass,
-          '${student.namaSiswa} terdaftar di kelas ${student.kelas}, bukan ${jadwal.kelas}.',
-        );
+
+      // 3. Validate class — guru hanya boleh absen siswa dari kelas yang
+      //    dia ajar.
+      if (jadwal != null) {
+        // Kalau ada jadwal terdeteksi: siswa harus dari kelas itu.
+        if (_normalizeKelas(student.kelas) !=
+            _normalizeKelas(jadwal.kelas)) {
+          throw AttendanceException(
+            AttendanceErrorCode.studentWrongClass,
+            '${student.namaSiswa} dari kelas ${student.kelas}, '
+            'sedang absensi kelas ${jadwal.kelas}.',
+          );
+        }
+      } else {
+        // Kalau tidak ada jadwal terdeteksi: siswa harus dari salah satu
+        // kelas yang guru ajar (dari teacherClassesProvider).
+        final taught = ref.read(teacherClassesProvider).maybeWhen(
+              data: (list) => list,
+              orElse: () => const <String>[],
+            );
+        final taughtNorm = taught.map(_normalizeKelas).toSet();
+        if (taughtNorm.isNotEmpty &&
+            !taughtNorm.contains(_normalizeKelas(student.kelas))) {
+          throw AttendanceException(
+            AttendanceErrorCode.studentWrongClass,
+            '${student.namaSiswa} dari kelas ${student.kelas} — '
+            'Anda tidak mengajar kelas tersebut.',
+          );
+        }
       }
 
-      // 3. Cek duplikat lokal (cepat sebelum hit server)
+      // 4. Check local duplicate
       if (state.studentIdsTercatat.contains(student.id)) {
         throw AttendanceException(
           AttendanceErrorCode.duplicate,
@@ -262,15 +296,15 @@ class ClassAttendanceSessionNotifier
         );
       }
 
-      // 4. Build record + insert
+      // 5. Build record + insert
       final now = DateTime.now();
       final record = AbsensiRecord(
-        idJadwal: jadwal.id,
+        idJadwal: jadwal?.id ?? '',
         idSiswa: student.id,
         idGuru: guruStaffId,
         idSekolah: idSekolah,
-        kelas: jadwal.kelas,
-        mataPelajaran: jadwal.mataPelajaran,
+        kelas: jadwal?.kelas ?? student.kelas,
+        mataPelajaran: jadwal?.mataPelajaran ?? '',
         tanggalAbsensi: _formatDate(now),
         jamAbsensi: _formatTime(now),
         tipeAbsensi: tipe,
@@ -285,8 +319,9 @@ class ClassAttendanceSessionNotifier
 
       final saved = await repository.createRecord(record);
       state = state.copyWith(
-        history: [saved, ...state.history],
+        todayHistory: [saved, ...state.todayHistory],
         isSubmitting: false,
+        lastScannedStudent: student,
         clearError: true,
       );
       return saved;
@@ -303,18 +338,36 @@ class ClassAttendanceSessionNotifier
     }
   }
 
-  /// Batalkan salah satu record (swipe-to-dismiss).
+  /// Normalize nama kelas untuk matching tahan terhadap variasi
+  /// spasi/dash/case. "XI DKV" vs "XI-DKV" vs "xi dkv" → "XIDKV".
+  String _normalizeKelas(String s) =>
+      s.toUpperCase().replaceAll(RegExp(r'[\s\-_/.]+'), '');
+
+  /// Undo a record (swipe-to-dismiss).
   Future<void> undoRecord(AbsensiRecord record) async {
     final idSekolah = ref.read(currentIdSekolahProvider);
     if (idSekolah == null || record.id == null) return;
     try {
       await repository.deleteRecord(id: record.id!, idSekolah: idSekolah);
       state = state.copyWith(
-        history: state.history.where((r) => r.id != record.id).toList(),
+        todayHistory:
+            state.todayHistory.where((r) => r.id != record.id).toList(),
       );
     } on AttendanceException catch (e) {
       state = state.copyWith(lastError: e);
     }
+  }
+
+  /// Go back — reset state.
+  void back() {
+    state = const SimpleAttendanceState();
+    _autoDetectJadwal();
+  }
+
+  /// Full reset.
+  void reset() {
+    state = const SimpleAttendanceState();
+    _autoDetectJadwal();
   }
 
   String _today() {
@@ -333,9 +386,7 @@ class ClassAttendanceSessionNotifier
   }
 }
 
-/// Nilai yang dikirim UI ke notifier setiap kali scan berhasil.
-/// Dibungkus class supaya kita bisa bawa metadata seperti qrPayload / rfidCode
-/// untuk diisi ke kolom absensi.
+/// Input yang dikirim UI ke notifier setiap kali scan berhasil.
 abstract class ScanInput {
   Future<StudentLite> resolve(StudentResolver resolver, String idSekolah);
   String? get rfidCodeForRecord => null;
@@ -379,8 +430,8 @@ class ManualScanInput extends ScanInput {
 }
 
 final classAttendanceSessionProvider = StateNotifierProvider.autoDispose<
-    ClassAttendanceSessionNotifier, ClassAttendanceSessionState>((ref) {
-  return ClassAttendanceSessionNotifier(
+    SimpleAttendanceNotifier, SimpleAttendanceState>((ref) {
+  return SimpleAttendanceNotifier(
     ref: ref,
     repository: ref.watch(absensiRepositoryProvider),
     resolver: ref.watch(studentResolverProvider),
